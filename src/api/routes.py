@@ -105,29 +105,69 @@ def _op_metadata(progress: int = 0) -> dict:
     return {"createTime": now, "progressPercent": progress}
 
 
+def _normalize_operation_id(operation_name: str) -> str:
+    """支持传 operation_id 或 operations/{operation_id}"""
+    return operation_name.removeprefix("operations/")
+
+
+def _build_video_operation_response(operation_id: str, video_url: str, progress: int = 100) -> dict:
+    """构造 Gemini 风格 operation.response，同时兼容旧字段"""
+    return {
+        "name": f"operations/{operation_id}",
+        "metadata": _op_metadata(progress),
+        "done": True,
+        "response": {
+            "generateVideoResponse": {
+                "generatedSamples": [{
+                    "video": {
+                        "uri": video_url,
+                        "mimeType": "video/mp4"
+                    }
+                }]
+            },
+            # backward compatibility
+            "generatedVideos": [{"video": {"uri": video_url, "mimeType": "video/mp4"}}],
+            "raiMediaFilteredCount": 0,
+            "raiMediaFilteredReasons": []
+        }
+    }
+
+
 @router.get("/v1beta/models")
 async def list_models(api_key: str = Depends(verify_api_key_header)):
-    """List available models"""
+    """Gemini v1beta list models"""
     models = []
-    for model_id, config in MODEL_CONFIG.items():
-        description = f"{config['type'].capitalize()} generation"
-        description += f" - {config['model_name']}" if config['type'] == 'image' else f" - {config['model_key']}"
+    for model_id, cfg in MODEL_CONFIG.items():
+        methods = ["predictLongRunning"] if cfg["type"] == "video" else ["predict"]
         models.append({
-            "id": model_id,
-            "object": "model",
-            "owned_by": "flow2api",
-            "description": description
+            "name": f"models/{model_id}",
+            "baseModelId": model_id,
+            "displayName": model_id,
+            "description": f"Flow2API proxied {cfg['type']} model",
+            "supportedGenerationMethods": methods,
         })
-    return {"object": "list", "data": models}
+    return {"models": models}
 
 
-@router.post("/v1beta/models/{model}:generateImages")
-async def generate_images(
-    model: str,
-    payload: dict,
-    api_key: str = Depends(verify_api_key_header)
-):
-    """Gemini v1beta: models.generateImages"""
+@router.get("/v1beta/models/{model}")
+async def get_model(model: str, api_key: str = Depends(verify_api_key_header)):
+    """Gemini v1beta get model"""
+    cfg = MODEL_CONFIG.get(model)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"Model {model} not found")
+
+    methods = ["predictLongRunning"] if cfg["type"] == "video" else ["predict"]
+    return {
+        "name": f"models/{model}",
+        "baseModelId": model,
+        "displayName": model,
+        "description": f"Flow2API proxied {cfg['type']} model",
+        "supportedGenerationMethods": methods,
+    }
+
+
+async def _predict_image_internal(model: str, payload: dict) -> dict:
+    """Gemini v1beta: models.predict for image models"""
     model_config = MODEL_CONFIG.get(model)
     if not model_config or model_config.get("type") != "image":
         raise HTTPException(status_code=400, detail=f"Model {model} is not an image model")
@@ -154,14 +194,39 @@ async def generate_images(
     if not image_data:
         raise HTTPException(status_code=500, detail="Failed to fetch generated image")
 
+    image_b64 = base64.b64encode(image_data).decode("utf-8")
     return {
+        "predictions": [{
+            "bytesBase64Encoded": image_b64,
+            "mimeType": "image/png"
+        }],
+        # backward compatibility
         "generatedImages": [{
             "image": {
-                "imageBytes": base64.b64encode(image_data).decode("utf-8"),
+                "imageBytes": image_b64,
                 "mimeType": "image/png"
             }
         }]
     }
+
+
+@router.post("/v1beta/models/{model}:predict")
+async def predict_image(
+    model: str,
+    payload: dict,
+    api_key: str = Depends(verify_api_key_header)
+):
+    return await _predict_image_internal(model, payload)
+
+
+# backward compatibility for previous implementation
+@router.post("/v1beta/models/{model}:generateImages")
+async def generate_images(
+    model: str,
+    payload: dict,
+    api_key: str = Depends(verify_api_key_header)
+):
+    return await _predict_image_internal(model, payload)
 
 
 @router.post("/v1beta/models/{model}:predictLongRunning")
@@ -245,7 +310,7 @@ async def predict_long_running(
         raise HTTPException(status_code=500, detail="Failed to create operation")
 
     op = operations[0]
-    task_id = op["operation"]["name"]
+    task_id = _normalize_operation_id(op["operation"]["name"])
     scene_id = op.get("sceneId")
 
     await generation_handler.db.create_task(Task(
@@ -264,28 +329,21 @@ async def predict_long_running(
     }
 
 
-@router.get("/v1beta/operations/{operation_id}")
+@router.get("/v1beta/operations/{operation_id:path}")
 async def get_operation(
     operation_id: str,
     api_key: str = Depends(verify_api_key_header)
 ):
     """Gemini v1beta: operation polling"""
+    operation_id = _normalize_operation_id(operation_id)
+
     task = await generation_handler.db.get_task(operation_id)
     if not task:
         raise HTTPException(status_code=404, detail="Operation not found")
 
     if task.status == "completed":
         url = task.result_urls[0] if task.result_urls else ""
-        return {
-            "name": f"operations/{operation_id}",
-            "metadata": _op_metadata(100),
-            "done": True,
-            "response": {
-                "generatedVideos": [{"video": {"uri": url, "mimeType": "video/mp4"}}],
-                "raiMediaFilteredCount": 0,
-                "raiMediaFilteredReasons": []
-            }
-        }
+        return _build_video_operation_response(operation_id, url)
 
     if task.status == "failed":
         return {
@@ -313,18 +371,10 @@ async def get_operation(
 
     if status == "SUCCEEDED":
         samples = checked.get("generatedSamples") or []
-        video_url = samples[0].get("video", {}).get("fifeUrl", "") if samples else ""
+        video_obj = samples[0].get("video", {}) if samples else {}
+        video_url = video_obj.get("uri") or video_obj.get("fifeUrl") or ""
         await generation_handler.db.update_task(operation_id, status="completed", progress=100, result_urls=[video_url])
-        return {
-            "name": f"operations/{operation_id}",
-            "metadata": _op_metadata(100),
-            "done": True,
-            "response": {
-                "generatedVideos": [{"video": {"uri": video_url, "mimeType": "video/mp4"}}],
-                "raiMediaFilteredCount": 0,
-                "raiMediaFilteredReasons": []
-            }
-        }
+        return _build_video_operation_response(operation_id, video_url)
 
     if status == "FAILED":
         err = checked.get("error", {}).get("message", "Video generation failed")

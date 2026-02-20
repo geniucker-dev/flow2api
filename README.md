@@ -144,33 +144,59 @@ python main.py
 
 ## 📡 API 使用示例（Gemini v1beta）
 
-### 1) 生成图片 `models.generateImages`
+## 🔐 认证方式
+
+Gemini v1beta 端点支持以下三种鉴权方式（任选其一）：
+
+- `Authorization: Bearer <API_KEY>`
+- `x-goog-api-key: <API_KEY>`
+- 查询参数 `?key=<API_KEY>`
+
+### 1) 列出模型 `models.list`
 
 ```bash
-curl -X POST "http://localhost:8000/v1beta/models/gemini-2.5-flash-image-landscape:generateImages" \
-  -H "Authorization: Bearer han1234" \
+curl "http://localhost:8000/v1beta/models?key=han1234"
+```
+
+### 2) 查询单个模型 `models.get`
+
+```bash
+curl "http://localhost:8000/v1beta/models/gemini-2.5-flash-image-landscape?key=han1234"
+```
+
+### 3) 图片生成 `models.predict`（Imagen/Gemini 图片模型）
+
+```bash
+curl -X POST "http://localhost:8000/v1beta/models/gemini-2.5-flash-image-landscape:predict" \
+  -H "x-goog-api-key: han1234" \
   -H "Content-Type: application/json" \
   -d '{
     "instances": [
       {
         "prompt": "一只可爱的猫咪在花园里玩耍"
       }
-    ]
+    ],
+    "parameters": {
+      "sampleCount": 1
+    }
   }'
 ```
 
-### 2) 创建视频长任务 `models:predictLongRunning`
+### 4) 创建视频长任务 `models.predictLongRunning`
 
 ```bash
 curl -X POST "http://localhost:8000/v1beta/models/veo_3_1_t2v_fast_landscape:predictLongRunning" \
-  -H "Authorization: Bearer han1234" \
+  -H "x-goog-api-key: han1234" \
   -H "Content-Type: application/json" \
   -d '{
     "instances": [
       {
         "prompt": "一只小猫在草地上追逐蝴蝶"
       }
-    ]
+    ],
+    "parameters": {
+      "durationSeconds": 5
+    }
   }'
 ```
 
@@ -187,13 +213,16 @@ curl -X POST "http://localhost:8000/v1beta/models/veo_3_1_t2v_fast_landscape:pre
 }
 ```
 
-### 3) 轮询视频任务 `operations.get`
+### 5) 轮询视频任务 `operations.get`
 
 ```bash
-curl -X GET "http://localhost:8000/v1beta/operations/OPERATION_ID" \
-  -H "Authorization: Bearer han1234"
+curl -X GET "http://localhost:8000/v1beta/operations/OPERATION_ID?key=han1234"
 ```
----
+
+任务完成时，可从以下路径读取视频地址：
+
+- `response.generateVideoResponse.generatedSamples[0].video.uri`
+
 
 ## 📄 许可证
 
