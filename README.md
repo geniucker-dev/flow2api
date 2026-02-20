@@ -142,108 +142,57 @@ python main.py
 | `veo_3_0_r2v_fast_portrait` | 图生视频 | 竖屏 |
 | `veo_3_0_r2v_fast_landscape` | 图生视频 | 横屏 |
 
-## 📡 API 使用示例（需要使用流式）
+## 📡 API 使用示例（Gemini v1beta）
 
-### 文生图
+### 1) 生成图片 `models.generateImages`
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8000/v1beta/models/gemini-2.5-flash-image-landscape:generateImages" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemini-2.5-flash-image-landscape",
-    "messages": [
+    "instances": [
       {
-        "role": "user",
-        "content": "一只可爱的猫咪在花园里玩耍"
+        "prompt": "一只可爱的猫咪在花园里玩耍"
       }
-    ],
-    "stream": true
+    ]
   }'
 ```
 
-### 图生图
+### 2) 创建视频长任务 `models:predictLongRunning`
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
+curl -X POST "http://localhost:8000/v1beta/models/veo_3_1_t2v_fast_landscape:predictLongRunning" \
   -H "Authorization: Bearer han1234" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "imagen-4.0-generate-preview-landscape",
-    "messages": [
+    "instances": [
       {
-        "role": "user",
-        "content": [
-          {
-            "type": "text",
-            "text": "将这张图片变成水彩画风格"
-          },
-          {
-            "type": "image_url",
-            "image_url": {
-              "url": "data:image/jpeg;base64,<base64_encoded_image>"
-            }
-          }
-        ]
+        "prompt": "一只小猫在草地上追逐蝴蝶"
       }
-    ],
-    "stream": true
+    ]
   }'
 ```
 
-### 文生视频
+返回示例：
+
+```json
+{
+  "name": "operations/OPERATION_ID",
+  "metadata": {
+    "createTime": "2026-02-20T00:00:00Z",
+    "progressPercent": 0
+  },
+  "done": false
+}
+```
+
+### 3) 轮询视频任务 `operations.get`
 
 ```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "veo_3_1_t2v_fast_landscape",
-    "messages": [
-      {
-        "role": "user",
-        "content": "一只小猫在草地上追逐蝴蝶"
-      }
-    ],
-    "stream": true
-  }'
+curl -X GET "http://localhost:8000/v1beta/operations/OPERATION_ID" \
+  -H "Authorization: Bearer han1234"
 ```
-
-### 首尾帧生成视频
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "veo_3_1_i2v_s_fast_fl_landscape",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          {
-            "type": "text",
-            "text": "从第一张图过渡到第二张图"
-          },
-          {
-            "type": "image_url",
-            "image_url": {
-              "url": "data:image/jpeg;base64,<首帧base64>"
-            }
-          },
-          {
-            "type": "image_url",
-            "image_url": {
-              "url": "data:image/jpeg;base64,<尾帧base64>"
-            }
-          }
-        ]
-      }
-    ],
-    "stream": true
-  }'
-```
-
 ---
 
 ## 📄 许可证

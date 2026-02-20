@@ -1,15 +1,15 @@
-"""API routes - OpenAI compatible endpoints"""
+"""API routes - Gemini v1beta endpoints"""
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import base64
 import re
-import json
 import time
 from urllib.parse import urlparse
+
 from curl_cffi.requests import AsyncSession
+
 from ..core.auth import verify_api_key_header
-from ..core.models import ChatCompletionRequest
+from ..core.models import Task
 from ..services.generation_handler import GenerationHandler, MODEL_CONFIG
 from ..core.logger import debug_logger
 
@@ -26,18 +26,12 @@ def set_generation_handler(handler: GenerationHandler):
 
 
 async def retrieve_image_data(url: str) -> Optional[bytes]:
-    """
-    智能获取图片数据：
-    1. 优先检查是否为本地 /tmp/ 缓存文件，如果是则直接读取磁盘
-    2. 如果本地不存在或是外部链接，则进行网络下载
-    """
-    # 优先尝试本地读取
+    """优先本地缓存读取，失败后回退网络下载"""
     try:
         if "/tmp/" in url and generation_handler and generation_handler.file_cache:
             path = urlparse(url).path
             filename = path.split("/tmp/")[-1]
             local_file_path = generation_handler.file_cache.cache_dir / filename
-
             if local_file_path.exists() and local_file_path.is_file():
                 data = local_file_path.read_bytes()
                 if data:
@@ -45,181 +39,308 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
     except Exception as e:
         debug_logger.log_warning(f"[CONTEXT] 本地缓存读取失败: {str(e)}")
 
-    # 回退逻辑：网络下载
     try:
         async with AsyncSession() as session:
             response = await session.get(url, timeout=30, impersonate="chrome110", verify=False)
             if response.status_code == 200:
                 return response.content
-            else:
-                debug_logger.log_warning(f"[CONTEXT] 图片下载失败，状态码: {response.status_code}")
+            debug_logger.log_warning(f"[CONTEXT] 图片下载失败，状态码: {response.status_code}")
     except Exception as e:
         debug_logger.log_error(f"[CONTEXT] 图片下载异常: {str(e)}")
 
     return None
 
 
-@router.get("/v1/models")
+def _extract_prompt_and_images(payload: dict) -> Tuple[str, List[bytes]]:
+    """解析 Gemini v1beta instances/parameters 输入"""
+    prompt = payload.get("prompt", "")
+    images: List[bytes] = []
+
+    instances = payload.get("instances") if isinstance(payload.get("instances"), list) else []
+    if instances:
+        first = instances[0] if isinstance(instances[0], dict) else {}
+        prompt = first.get("prompt") or first.get("text") or prompt
+
+        raw_images = first.get("images") if isinstance(first.get("images"), list) else []
+        if not raw_images:
+            raw_images = [first]  # 兼容单图字段
+
+        for item in raw_images:
+            if not isinstance(item, dict):
+                continue
+            image_b64 = (
+                item.get("imageBytes")
+                or item.get("bytesBase64Encoded")
+                or (item.get("image", {}).get("imageBytes") if isinstance(item.get("image"), dict) else None)
+            )
+            if image_b64:
+                images.append(base64.b64decode(image_b64))
+
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    return prompt, images
+
+
+async def _prepare_generation_context(model: str, generation_type: str):
+    """选 token + 刷新 AT + 准备 project_id"""
+    if generation_type == "image":
+        token = await generation_handler.load_balancer.select_token(for_image_generation=True, model=model)
+    else:
+        token = await generation_handler.load_balancer.select_token(for_video_generation=True, model=model)
+
+    if not token:
+        raise HTTPException(status_code=503, detail="No available token")
+
+    if not await generation_handler.token_manager.is_at_valid(token.id):
+        raise HTTPException(status_code=503, detail="Token AT invalid or refresh failed")
+
+    token = await generation_handler.token_manager.get_token(token.id)
+    project_id = await generation_handler.token_manager.ensure_project_exists(token.id)
+    return token, project_id
+
+
+def _op_metadata(progress: int = 0) -> dict:
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return {"createTime": now, "progressPercent": progress}
+
+
+@router.get("/v1beta/models")
 async def list_models(api_key: str = Depends(verify_api_key_header)):
     """List available models"""
     models = []
-
     for model_id, config in MODEL_CONFIG.items():
         description = f"{config['type'].capitalize()} generation"
-        if config['type'] == 'image':
-            description += f" - {config['model_name']}"
-        else:
-            description += f" - {config['model_key']}"
-
+        description += f" - {config['model_name']}" if config['type'] == 'image' else f" - {config['model_key']}"
         models.append({
             "id": model_id,
             "object": "model",
             "owned_by": "flow2api",
             "description": description
         })
+    return {"object": "list", "data": models}
+
+
+@router.post("/v1beta/models/{model}:generateImages")
+async def generate_images(
+    model: str,
+    payload: dict,
+    api_key: str = Depends(verify_api_key_header)
+):
+    """Gemini v1beta: models.generateImages"""
+    model_config = MODEL_CONFIG.get(model)
+    if not model_config or model_config.get("type") != "image":
+        raise HTTPException(status_code=400, detail=f"Model {model} is not an image model")
+
+    prompt, images = _extract_prompt_and_images(payload)
+    token, project_id = await _prepare_generation_context(model, "image")
+
+    result = None
+    async for chunk in generation_handler._handle_image_generation(  # pylint: disable=protected-access
+        token, project_id, model_config, prompt, images if images else None, False
+    ):
+        result = chunk
+
+    if not result:
+        raise HTTPException(status_code=500, detail="Image generation failed")
+
+    # 现有 handler 非流式返回 Markdown 图片，提取 URL 并转 base64 输出
+    match = re.search(r"\((.*?)\)", result)
+    if not match:
+        raise HTTPException(status_code=500, detail="Cannot parse image URL from response")
+
+    image_url = match.group(1)
+    image_data = await retrieve_image_data(image_url)
+    if not image_data:
+        raise HTTPException(status_code=500, detail="Failed to fetch generated image")
 
     return {
-        "object": "list",
-        "data": models
+        "generatedImages": [{
+            "image": {
+                "imageBytes": base64.b64encode(image_data).decode("utf-8"),
+                "mimeType": "image/png"
+            }
+        }]
     }
 
 
-@router.post("/v1/chat/completions")
-async def create_chat_completion(
-    request: ChatCompletionRequest,
+@router.post("/v1beta/models/{model}:predictLongRunning")
+async def predict_long_running(
+    model: str,
+    payload: dict,
     api_key: str = Depends(verify_api_key_header)
 ):
-    """Create chat completion (unified endpoint for image and video generation)"""
-    try:
-        # Extract prompt from messages
-        if not request.messages:
-            raise HTTPException(status_code=400, detail="Messages cannot be empty")
+    """Gemini v1beta: Veo long-running task creation"""
+    model_config = MODEL_CONFIG.get(model)
+    if not model_config or model_config.get("type") != "video":
+        raise HTTPException(status_code=400, detail=f"Model {model} is not a video model")
 
-        last_message = request.messages[-1]
-        content = last_message.content
+    prompt, images = _extract_prompt_and_images(payload)
+    token, project_id = await _prepare_generation_context(model, "video")
 
-        # Handle both string and array format (OpenAI multimodal)
-        prompt = ""
-        images: List[bytes] = []
+    video_type = model_config.get("video_type", "t2v")
 
-        if isinstance(content, str):
-            # Simple text format
-            prompt = content
-        elif isinstance(content, list):
-            # Multimodal format
-            for item in content:
-                if item.get("type") == "text":
-                    prompt = item.get("text", "")
-                elif item.get("type") == "image_url":
-                    # Extract image from URL or base64
-                    image_url = item.get("image_url", {}).get("url", "")
-                    if image_url.startswith("data:image"):
-                        # Parse base64
-                        match = re.search(r"base64,(.+)", image_url)
-                        if match:
-                            image_base64 = match.group(1)
-                            image_bytes = base64.b64decode(image_base64)
-                            images.append(image_bytes)
-                    elif image_url.startswith("http://") or image_url.startswith("https://"):
-                        # Download remote image URL
-                        debug_logger.log_info(f"[IMAGE_URL] 下载远程图片: {image_url}")
-                        try:
-                            downloaded_bytes = await retrieve_image_data(image_url)
-                            if downloaded_bytes and len(downloaded_bytes) > 0:
-                                images.append(downloaded_bytes)
-                                debug_logger.log_info(f"[IMAGE_URL] ✅ 远程图片下载成功: {len(downloaded_bytes)} 字节")
-                            else:
-                                debug_logger.log_warning(f"[IMAGE_URL] ⚠️ 远程图片下载失败或为空: {image_url}")
-                        except Exception as e:
-                            debug_logger.log_error(f"[IMAGE_URL] ❌ 远程图片下载异常: {str(e)}")
+    if video_type == "i2v":
+        if len(images) < 1 or len(images) > 2:
+            raise HTTPException(status_code=400, detail="i2v model requires 1-2 images")
 
-        # Fallback to deprecated image parameter
-        if request.image and not images:
-            if request.image.startswith("data:image"):
-                match = re.search(r"base64,(.+)", request.image)
-                if match:
-                    image_base64 = match.group(1)
-                    image_bytes = base64.b64decode(image_base64)
-                    images.append(image_bytes)
-
-        # 自动参考图：仅对图片模型生效
-        model_config = MODEL_CONFIG.get(request.model)
-
-        if model_config and model_config["type"] == "image" and len(request.messages) > 1:
-            debug_logger.log_info(f"[CONTEXT] 开始查找历史参考图，消息数量: {len(request.messages)}")
-
-            # 查找上一次 assistant 回复的图片
-            for msg in reversed(request.messages[:-1]):
-                if msg.role == "assistant" and isinstance(msg.content, str):
-                    # 匹配 Markdown 图片格式: ![...](http...)
-                    matches = re.findall(r"!\[.*?\]\((.*?)\)", msg.content)
-                    if matches:
-                        last_image_url = matches[-1]
-
-                        if last_image_url.startswith("http"):
-                            try:
-                                downloaded_bytes = await retrieve_image_data(last_image_url)
-                                if downloaded_bytes and len(downloaded_bytes) > 0:
-                                    # 将历史图片插入到最前面
-                                    images.insert(0, downloaded_bytes)
-                                    debug_logger.log_info(f"[CONTEXT] ✅ 添加历史参考图: {last_image_url}")
-                                    break
-                                else:
-                                    debug_logger.log_warning(f"[CONTEXT] 图片下载失败或为空，尝试下一个: {last_image_url}")
-                            except Exception as e:
-                                debug_logger.log_error(f"[CONTEXT] 处理参考图时出错: {str(e)}")
-                                # 继续尝试下一个图片
-
-        if not prompt:
-            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
-
-        # Call generation handler
-        if request.stream:
-            # Streaming response
-            async def generate():
-                async for chunk in generation_handler.handle_generation(
-                    model=request.model,
-                    prompt=prompt,
-                    images=images if images else None,
-                    stream=True
-                ):
-                    yield chunk
-
-                # Send [DONE] signal
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(
-                generate(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no"
-                }
+        start_media_id = await generation_handler.flow_client.upload_image(
+            token.at, images[0], model_config["aspect_ratio"]
+        )
+        if len(images) == 2:
+            end_media_id = await generation_handler.flow_client.upload_image(
+                token.at, images[1], model_config["aspect_ratio"]
+            )
+            result = await generation_handler.flow_client.generate_video_start_end(
+                at=token.at,
+                project_id=project_id,
+                prompt=prompt,
+                model_key=model_config["model_key"],
+                aspect_ratio=model_config["aspect_ratio"],
+                start_media_id=start_media_id,
+                end_media_id=end_media_id,
+                user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
             )
         else:
-            # Non-streaming response
-            result = None
-            async for chunk in generation_handler.handle_generation(
-                model=request.model,
+            actual_model_key = model_config["model_key"].replace("_fl_", "_")
+            if actual_model_key.endswith("_fl"):
+                actual_model_key = actual_model_key[:-3]
+            result = await generation_handler.flow_client.generate_video_start_image(
+                at=token.at,
+                project_id=project_id,
                 prompt=prompt,
-                images=images if images else None,
-                stream=False
-            ):
-                result = chunk
+                model_key=actual_model_key,
+                aspect_ratio=model_config["aspect_ratio"],
+                start_media_id=start_media_id,
+                user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
+            )
 
-            if result:
-                # Parse the result JSON string
-                try:
-                    result_json = json.loads(result)
-                    return JSONResponse(content=result_json)
-                except json.JSONDecodeError:
-                    # If not JSON, return as-is
-                    return JSONResponse(content={"result": result})
-            else:
-                raise HTTPException(status_code=500, detail="Generation failed: No response from handler")
+    elif video_type == "r2v" and images:
+        refs = []
+        for img in images:
+            media_id = await generation_handler.flow_client.upload_image(token.at, img, model_config["aspect_ratio"])
+            refs.append({"imageUsageType": "IMAGE_USAGE_TYPE_ASSET", "mediaId": media_id})
+        result = await generation_handler.flow_client.generate_video_reference_images(
+            at=token.at,
+            project_id=project_id,
+            prompt=prompt,
+            model_key=model_config["model_key"],
+            aspect_ratio=model_config["aspect_ratio"],
+            reference_images=refs,
+            user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
+        )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    else:
+        result = await generation_handler.flow_client.generate_video_text(
+            at=token.at,
+            project_id=project_id,
+            prompt=prompt,
+            model_key=model_config["model_key"],
+            aspect_ratio=model_config["aspect_ratio"],
+            user_paygate_tier=token.user_paygate_tier or "PAYGATE_TIER_ONE"
+        )
+
+    operations = result.get("operations", [])
+    if not operations:
+        raise HTTPException(status_code=500, detail="Failed to create operation")
+
+    op = operations[0]
+    task_id = op["operation"]["name"]
+    scene_id = op.get("sceneId")
+
+    await generation_handler.db.create_task(Task(
+        task_id=task_id,
+        token_id=token.id,
+        model=model_config["model_key"],
+        prompt=prompt,
+        status="processing",
+        scene_id=scene_id
+    ))
+
+    return {
+        "name": f"operations/{task_id}",
+        "metadata": _op_metadata(0),
+        "done": False
+    }
+
+
+@router.get("/v1beta/operations/{operation_id}")
+async def get_operation(
+    operation_id: str,
+    api_key: str = Depends(verify_api_key_header)
+):
+    """Gemini v1beta: operation polling"""
+    task = await generation_handler.db.get_task(operation_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Operation not found")
+
+    if task.status == "completed":
+        url = task.result_urls[0] if task.result_urls else ""
+        return {
+            "name": f"operations/{operation_id}",
+            "metadata": _op_metadata(100),
+            "done": True,
+            "response": {
+                "generatedVideos": [{"video": {"uri": url, "mimeType": "video/mp4"}}],
+                "raiMediaFilteredCount": 0,
+                "raiMediaFilteredReasons": []
+            }
+        }
+
+    if task.status == "failed":
+        return {
+            "name": f"operations/{operation_id}",
+            "done": True,
+            "error": {
+                "code": 500,
+                "message": task.error_message or "Video generation failed",
+                "details": []
+            }
+        }
+
+    token = await generation_handler.token_manager.get_token(task.token_id)
+    if not token or not token.at:
+        raise HTTPException(status_code=500, detail="Token unavailable for polling")
+
+    status_result = await generation_handler.flow_client.check_video_status(token.at, [{
+        "operation": {"name": operation_id},
+        "sceneId": task.scene_id,
+        "status": "RUNNING"
+    }])
+
+    checked = (status_result.get("operations") or [{}])[0]
+    status = checked.get("status", "PENDING")
+
+    if status == "SUCCEEDED":
+        samples = checked.get("generatedSamples") or []
+        video_url = samples[0].get("video", {}).get("fifeUrl", "") if samples else ""
+        await generation_handler.db.update_task(operation_id, status="completed", progress=100, result_urls=[video_url])
+        return {
+            "name": f"operations/{operation_id}",
+            "metadata": _op_metadata(100),
+            "done": True,
+            "response": {
+                "generatedVideos": [{"video": {"uri": video_url, "mimeType": "video/mp4"}}],
+                "raiMediaFilteredCount": 0,
+                "raiMediaFilteredReasons": []
+            }
+        }
+
+    if status == "FAILED":
+        err = checked.get("error", {}).get("message", "Video generation failed")
+        await generation_handler.db.update_task(operation_id, status="failed", error_message=err)
+        return {
+            "name": f"operations/{operation_id}",
+            "done": True,
+            "error": {
+                "code": 500,
+                "message": err,
+                "details": []
+            }
+        }
+
+    return {
+        "name": f"operations/{operation_id}",
+        "metadata": _op_metadata(10),
+        "done": False
+    }
