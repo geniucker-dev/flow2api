@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import time
+import urllib.request
 from typing import Optional, AsyncGenerator, List, Dict, Any
 from ..core.logger import debug_logger
 from ..core.config import config
@@ -878,12 +879,12 @@ class GenerationHandler:
                                     if stream:
                                         yield self._create_stream_chunk(f"✅ {resolution_name} 图片缓存成功\n")
                                         yield self._create_stream_chunk(
-                                            f"![Generated Image]({local_url})",
+                                            json.dumps({"b64_json": encoded_image}, ensure_ascii=False),
                                             finish_reason="stop"
                                         )
                                     else:
                                         yield self._create_completion_response(
-                                            local_url,
+                                            encoded_image,
                                             media_type="image"
                                         )
                                     return
@@ -892,16 +893,15 @@ class GenerationHandler:
                                     if stream:
                                         yield self._create_stream_chunk(f"⚠️ 缓存失败: {str(e)}，返回 base64...\n")
 
-                            # 缓存未启用或缓存失败，返回 base64 格式
-                            base64_url = f"data:image/jpeg;base64,{encoded_image}"
+                            # 缓存未启用或缓存失败，返回 b64_json
                             if stream:
                                 yield self._create_stream_chunk(
-                                    f"![Generated Image]({base64_url})",
+                                    json.dumps({"b64_json": encoded_image}, ensure_ascii=False),
                                     finish_reason="stop"
                                 )
                             else:
                                 yield self._create_completion_response(
-                                    base64_url,
+                                    encoded_image,
                                     media_type="image"
                                 )
                             return
@@ -948,18 +948,20 @@ class GenerationHandler:
                 if stream:
                     yield self._create_stream_chunk("缓存已关闭,正在返回源链接...\n")
 
-            # 返回结果
+            # 返回结果（对外统一返回 b64_json，不返回 URL）
             # 存储URL用于日志记录
             self._last_generated_url = local_url
 
+            image_b64 = await self._image_url_to_b64(image_url)
+
             if stream:
                 yield self._create_stream_chunk(
-                    f"![Generated Image]({local_url})",
+                    json.dumps({"b64_json": image_b64}, ensure_ascii=False),
                     finish_reason="stop"
                 )
             else:
                 yield self._create_completion_response(
-                    local_url,  # 直接传URL,让方法内部格式化
+                    image_b64,
                     media_type="image"
                 )
 
@@ -1413,11 +1415,11 @@ class GenerationHandler:
         if is_availability_check:
             formatted_content = content
         else:
-            # 媒体生成: 根据媒体类型格式化内容为Markdown
+            # 媒体生成: 使用更接近 OpenAI 兼容的数据结构
             if media_type == "video":
-                formatted_content = f"```html\n<video src='{content}' controls></video>\n```"
+                formatted_content = [{"type": "video_url", "video_url": {"url": content}}]
             else:  # image
-                formatted_content = f"![Generated Image]({content})"
+                formatted_content = [{"type": "image", "b64_json": content}]
 
         response = {
             "id": f"chatcmpl-{int(time.time())}",
@@ -1450,6 +1452,15 @@ class GenerationHandler:
 
         return json.dumps(error, ensure_ascii=False)
 
+    async def _image_url_to_b64(self, image_url: str) -> str:
+        """下载图片 URL 并转换为 base64（用于对外 b64_json 响应）"""
+        def _download() -> bytes:
+            with urllib.request.urlopen(image_url, timeout=60) as response:
+                return response.read()
+
+        image_bytes = await asyncio.to_thread(_download)
+        return base64.b64encode(image_bytes).decode("utf-8")
+
     def _get_base_url(self) -> str:
         """获取基础URL用于缓存文件访问"""
         # 优先使用配置的cache_base_url
@@ -1481,4 +1492,3 @@ class GenerationHandler:
         except Exception as e:
             # 日志记录失败不影响主流程
             debug_logger.log_error(f"Failed to log request: {e}")
-
