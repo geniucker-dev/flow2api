@@ -1,6 +1,6 @@
 """API routes - Gemini v1beta endpoints"""
 from fastapi import APIRouter, Depends, HTTPException
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 import base64
 import re
 import time
@@ -17,6 +17,31 @@ router = APIRouter()
 
 # Dependency injection will be set up in main.py
 generation_handler: GenerationHandler = None
+
+
+UNIFIED_VIDEO_MODELS: Dict[str, Dict[str, str]] = {
+    # Gemini-style unified Veo model ids -> internal model ids
+    "veo-3.1-generate-preview": {
+        "t2v_landscape": "veo_3_1_t2v_landscape",
+        "t2v_portrait": "veo_3_1_t2v_portrait",
+        "i2v_landscape": "veo_3_1_i2v_s_fast_fl",
+        "i2v_portrait": "veo_3_1_i2v_s_fast_portrait_fl",
+        "r2v_landscape": "veo_3_0_r2v_fast",
+        "r2v_portrait": "veo_3_0_r2v_fast_portrait",
+    },
+    "veo-3.1-fast-generate-preview": {
+        "t2v_landscape": "veo_3_1_t2v_fast_landscape",
+        "t2v_portrait": "veo_3_1_t2v_fast_portrait",
+        "i2v_landscape": "veo_3_1_i2v_s_fast_fl",
+        "i2v_portrait": "veo_3_1_i2v_s_fast_portrait_fl",
+    },
+    "veo-2.0-generate-001": {
+        "t2v_landscape": "veo_2_0_t2v_landscape",
+        "t2v_portrait": "veo_2_0_t2v_portrait",
+        "i2v_landscape": "veo_2_0_i2v_landscape",
+        "i2v_portrait": "veo_2_0_i2v_portrait",
+    },
+}
 
 
 def set_generation_handler(handler: GenerationHandler):
@@ -80,6 +105,85 @@ def _extract_prompt_and_images(payload: dict) -> Tuple[str, List[bytes]]:
         raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
     return prompt, images
+
+
+def _decode_inline_data(item: Any) -> Optional[bytes]:
+    """Decode Gemini-style inlineData or legacy base64 fields."""
+    if not isinstance(item, dict):
+        return None
+
+    image_b64 = (
+        item.get("imageBytes")
+        or item.get("bytesBase64Encoded")
+        or (item.get("inlineData", {}).get("data") if isinstance(item.get("inlineData"), dict) else None)
+        or (item.get("image", {}).get("inlineData", {}).get("data") if isinstance(item.get("image"), dict) else None)
+        or (item.get("image", {}).get("imageBytes") if isinstance(item.get("image"), dict) else None)
+    )
+    if not image_b64:
+        return None
+
+    return base64.b64decode(image_b64)
+
+
+def _resolve_video_model_and_images(model: str, payload: dict) -> Tuple[str, str, List[bytes]]:
+    """Resolve request into (prompt, resolved_model, images)."""
+    if model not in UNIFIED_VIDEO_MODELS:
+        prompt, images = _extract_prompt_and_images(payload)
+        return prompt, model, images
+
+    instances = payload.get("instances") if isinstance(payload.get("instances"), list) else []
+    first = instances[0] if instances and isinstance(instances[0], dict) else {}
+    parameters = payload.get("parameters") if isinstance(payload.get("parameters"), dict) else {}
+
+    prompt = first.get("prompt") or first.get("text") or payload.get("prompt", "")
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+    if first.get("video"):
+        raise HTTPException(status_code=400, detail="Video extension mode is not supported yet")
+
+    aspect_ratio = parameters.get("aspectRatio", "16:9")
+    if aspect_ratio not in {"16:9", "9:16"}:
+        raise HTTPException(status_code=400, detail="aspectRatio must be '16:9' or '9:16'")
+    mode_key = "portrait" if aspect_ratio == "9:16" else "landscape"
+
+    images: List[bytes] = []
+    start_image = _decode_inline_data(first.get("image"))
+    last_frame = _decode_inline_data(parameters.get("lastFrame"))
+    if not start_image:
+        images_field = first.get("images") if isinstance(first.get("images"), list) else []
+        decoded_images = [_decode_inline_data(item) for item in images_field]
+        decoded_images = [img for img in decoded_images if img]
+        if decoded_images:
+            start_image = decoded_images[0]
+            if len(decoded_images) >= 2 and not last_frame:
+                last_frame = decoded_images[1]
+
+    reference_images_raw = parameters.get("referenceImages") if isinstance(parameters.get("referenceImages"), list) else []
+    reference_images = [img for img in (_decode_inline_data(ref) for ref in reference_images_raw) if img]
+
+    model_alias = UNIFIED_VIDEO_MODELS[model]
+    if reference_images:
+        selected_model = model_alias.get(f"r2v_{mode_key}")
+        if not selected_model:
+            raise HTTPException(status_code=400, detail=f"Model {model} does not support referenceImages")
+        if len(reference_images) > 3:
+            raise HTTPException(status_code=400, detail="referenceImages supports at most 3 images")
+        return prompt, selected_model, reference_images
+
+    if start_image:
+        selected_model = model_alias.get(f"i2v_{mode_key}")
+        if not selected_model:
+            raise HTTPException(status_code=400, detail=f"Model {model} does not support image input")
+        images.append(start_image)
+        if last_frame:
+            images.append(last_frame)
+        return prompt, selected_model, images
+
+    selected_model = model_alias.get(f"t2v_{mode_key}")
+    if not selected_model:
+        raise HTTPException(status_code=400, detail=f"Model {model} does not support text-only generation")
+    return prompt, selected_model, images
 
 
 async def _prepare_generation_context(model: str, generation_type: str):
@@ -146,12 +250,29 @@ async def list_models(api_key: str = Depends(verify_api_key_header)):
             "description": f"Flow2API proxied {cfg['type']} model",
             "supportedGenerationMethods": methods,
         })
+    for model_id in UNIFIED_VIDEO_MODELS:
+        models.append({
+            "name": f"models/{model_id}",
+            "baseModelId": model_id,
+            "displayName": model_id,
+            "description": "Unified Veo model id (mode selected by input payload)",
+            "supportedGenerationMethods": ["predictLongRunning"],
+        })
     return {"models": models}
 
 
 @router.get("/v1beta/models/{model}")
 async def get_model(model: str, api_key: str = Depends(verify_api_key_header)):
     """Gemini v1beta get model"""
+    if model in UNIFIED_VIDEO_MODELS:
+        return {
+            "name": f"models/{model}",
+            "baseModelId": model,
+            "displayName": model,
+            "description": "Unified Veo model id (mode selected by input payload)",
+            "supportedGenerationMethods": ["predictLongRunning"],
+        }
+
     cfg = MODEL_CONFIG.get(model)
     if not cfg:
         raise HTTPException(status_code=404, detail=f"Model {model} not found")
@@ -236,12 +357,14 @@ async def predict_long_running(
     api_key: str = Depends(verify_api_key_header)
 ):
     """Gemini v1beta: Veo long-running task creation"""
-    model_config = MODEL_CONFIG.get(model)
+    unified_request = model in UNIFIED_VIDEO_MODELS
+    prompt, resolved_model, images = _resolve_video_model_and_images(model, payload)
+
+    model_config = MODEL_CONFIG.get(resolved_model)
     if not model_config or model_config.get("type") != "video":
         raise HTTPException(status_code=400, detail=f"Model {model} is not a video model")
 
-    prompt, images = _extract_prompt_and_images(payload)
-    token, project_id = await _prepare_generation_context(model, "video")
+    token, project_id = await _prepare_generation_context(resolved_model, "video")
 
     video_type = model_config.get("video_type", "t2v")
 
@@ -316,7 +439,7 @@ async def predict_long_running(
     await generation_handler.db.create_task(Task(
         task_id=task_id,
         token_id=token.id,
-        model=model_config["model_key"],
+        model=model if unified_request else model_config["model_key"],
         prompt=prompt,
         status="processing",
         scene_id=scene_id
