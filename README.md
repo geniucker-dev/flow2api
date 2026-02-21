@@ -106,7 +106,15 @@ python main.py
 
 ### 视频生成
 
-#### 文生视频 (T2V - Text to Video)
+✅ **统一 Veo 接口（推荐）**：对外使用 Gemini 风格统一模型 ID，具体模式（文生视频 / 图生视频 / 首尾帧 / 参考图）由请求体自动判断。
+
+| 统一模型 ID | 说明 |
+|---------|---------|
+| `veo-3.1-generate-preview` | Veo 3.1（统一入口） |
+| `veo-3.1-fast-generate-preview` | Veo 3.1 Fast（统一入口） |
+| `veo-2.0-generate-001` | Veo 2（统一入口） |
+
+#### 文生视频 (T2V - Text to Video，兼容旧模型ID)
 ⚠️ **不支持上传图片**
 
 | 模型名称 | 说明| 尺寸 |
@@ -118,7 +126,7 @@ python main.py
 | `veo_2_0_t2v_portrait` | 文生视频 | 竖屏 |
 | `veo_2_0_t2v_landscape` | 文生视频 | 横屏 |
 
-#### 首尾帧模型 (I2V - Image to Video)
+#### 首尾帧模型 (I2V - Image to Video，兼容旧模型ID)
 📸 **支持1-2张图片：1张作为首帧，2张作为首尾帧**
 
 > 💡 **自动适配**：系统会根据图片数量自动选择对应的 model_key
@@ -134,7 +142,7 @@ python main.py
 | `veo_2_0_i2v_portrait` | 图生视频 | 竖屏 |
 | `veo_2_0_i2v_landscape` | 图生视频 | 横屏 |
 
-#### 多图生成 (R2V - Reference Images to Video)
+#### 多图生成 (R2V - Reference Images to Video，兼容旧模型ID)
 🖼️ **支持多张图片**
 
 | 模型名称 | 说明| 尺寸 |
@@ -185,7 +193,7 @@ curl -X POST "http://localhost:8000/v1beta/models/gemini-2.5-flash-image-landsca
 ### 4) 创建视频长任务 `models.predictLongRunning`
 
 ```bash
-curl -X POST "http://localhost:8000/v1beta/models/veo_3_1_t2v_fast_landscape:predictLongRunning" \
+curl -X POST "http://localhost:8000/v1beta/models/veo-3.1-generate-preview:predictLongRunning" \
   -H "x-goog-api-key: han1234" \
   -H "Content-Type: application/json" \
   -d '{
@@ -195,7 +203,28 @@ curl -X POST "http://localhost:8000/v1beta/models/veo_3_1_t2v_fast_landscape:pre
       }
     ],
     "parameters": {
-      "durationSeconds": 5
+      "aspectRatio": "16:9",
+      "durationSeconds": "8"
+    }
+  }'
+```
+
+图生视频（首帧 + 尾帧）示例：
+
+```bash
+curl -X POST "http://localhost:8000/v1beta/models/veo-3.1-generate-preview:predictLongRunning" \
+  -H "x-goog-api-key: han1234" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "instances": [
+      {
+        "prompt": "A cinematic transition from city to beach",
+        "image": {"inlineData": {"mimeType": "image/png", "data": "<BASE64_FIRST_FRAME>"}}
+      }
+    ],
+    "parameters": {
+      "lastFrame": {"inlineData": {"mimeType": "image/png", "data": "<BASE64_LAST_FRAME>"}},
+      "aspectRatio": "16:9"
     }
   }'
 ```
